@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BY VUSAL</title>
+<style>
+  :root{
+    --bg: #05080a;
+    --panel: #0c1416;
+    --line: #1c2226;
+    --accent: #ffe600;   /* жёлтый — рамка сканера */
+    --accent-2: #6fd7ff; /* голубой — акцент интерфейса */
+    --text: #e8f3ff;
+    --muted: #61707a;
+  }
+  *{ box-sizing: border-box; }
+  html, body{
+    margin:0; padding:0; height:100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Courier New', ui-monospace, Consolas, monospace;
+  }
+  body{
+    display:flex; flex-direction:column; align-items:center;
+    min-height:100vh; padding: 24px 16px 40px;
+  }
+  header{
+    width:100%; max-width: 720px;
+    display:flex; align-items:baseline; justify-content:space-between;
+    margin-bottom: 14px;
+  }
+  h1{
+    font-size: 15px; letter-spacing: 3px; text-transform: uppercase;
+    margin:0; color: var(--accent);
+    font-weight: 600;
+  }
+  #status-badge{
+    font-size: 11px; letter-spacing: 1px; text-transform: uppercase;
+    padding: 4px 10px; border-radius: 3px;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  #status-badge.active{ color: var(--accent); border-color: var(--accent); }
+  #status-badge.error{ color: #ff5c5c; border-color: #ff5c5c; }
+
+  .stage{
+    position: relative;
+    width: 100%; max-width: 720px;
+    aspect-ratio: 4 / 3;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .mirror{
+    position:absolute; inset:0;
+    transform: scaleX(-1);
+  }
+  video, canvas{
+    position:absolute; inset:0;
+    width:100%; height:100%;
+    display:block;
+    object-fit: cover;
+  }
+  video{ opacity: 0.95; }
+
+  .corner{
+    position:absolute; width:18px; height:18px;
+    border: 2px solid var(--accent);
+    opacity:0.7; z-index:3; pointer-events:none;
+  }
+  .corner.tl{ top:8px; left:8px; border-right:none; border-bottom:none; }
+  .corner.tr{ top:8px; right:8px; border-left:none; border-bottom:none; }
+  .corner.bl{ bottom:8px; left:8px; border-right:none; border-top:none; }
+  .corner.br{ bottom:8px; right:8px; border-left:none; border-top:none; }
+
+  .hint{
+    position:absolute; left:0; right:0; bottom:10px; z-index:4;
+    text-align:center; font-size:11px; letter-spacing:1px;
+    color: var(--accent-2); opacity:0.85; pointer-events:none;
+    text-shadow: 0 0 6px rgba(0,0,0,0.8);
+  }
+
+  .overlay-msg{
+    position:absolute; inset:0; z-index:5;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:14px; text-align:center; padding: 20px;
+    background: rgba(5,8,10,0.9);
+  }
+  .overlay-msg.hidden{ display:none; }
+  .overlay-msg p{ margin:0; font-size:13px; color: var(--muted); max-width: 440px; line-height:1.6; }
+
+  button{
+    font-family: inherit;
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    padding: 10px 22px;
+    font-size: 12px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  button:hover{ background: var(--accent); color: #201a00; }
+  button:disabled{ opacity:0.4; cursor:default; background:none; color:var(--accent); }
+
+  footer{
+    width:100%; max-width: 720px;
+    margin-top: 14px;
+    display:flex; justify-content:space-between;
+    font-size: 11px; color: var(--muted); letter-spacing: 0.5px;
+  }
+</style>
+</head>
+<body>
+
+  <header>
+    <h1>BY VUSAL</h1>
+    <div id="status-badge">инициализация</div>
+  </header>
+
+  <div class="stage" id="stage">
+    <div class="mirror">
+      <video id="video" playsinline autoplay muted></video>
+      <canvas id="canvas"></canvas>
+    </div>
+    <div class="corner tl"></div>
+    <div class="corner tr"></div>
+    <div class="corner bl"></div>
+    <div class="corner br"></div>
+    <div class="hint" id="hint">✌️ + ✌️ — покажи два жеста «виктория», чтобы включить сканер</div>
+
+    <div class="overlay-msg" id="start-overlay">
+      <p>Нужен доступ к камере: отслеживаем обе руки (MediaPipe Hands) и при жесте «виктория» на каждой строим окно-сканер между руками. Всё считается локально в браузере.</p>
+      <button id="start-btn">Разрешить камеру</button>
+    </div>
+  </div>
+
+  <footer>
+    <span id="fps-counter">fps: —</span>
+    <span id="hand-status">рук не обнаружено</span>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js" crossorigin="anonymous"></script>
+
+  <script>
+    const videoEl = document.getElementById('video');
+    const canvasEl = document.getElementById('canvas');
+    const ctx = canvasEl.getContext('2d');
+    const statusBadge = document.getElementById('status-badge');
+    const startOverlay = document.getElementById('start-overlay');
+    const startBtn = document.getElementById('start-btn');
+    const handStatusEl = document.getElementById('hand-status');
+    const fpsEl = document.getElementById('fps-counter');
+    const hintEl = document.getElementById('hint');
+
+    let lastFrameTime = performance.now();
+
+    // офскрин-канвас с "сырым" кадром камеры — из него вырезаем окно сканера
+    const srcCanvas = document.createElement('canvas');
+    const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
+    // временный канвас для повёрнутого патча перед дуотон-фильтром
+    const tempCanvas = document.createElement('canvas');
+    const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
+
+    function setStatus(text, mode){
+      statusBadge.textContent = text;
+      statusBadge.classList.remove('active', 'error');
+      if(mode) statusBadge.classList.add(mode);
+    }
+
+    // Жест "виктория": указательный и средний разогнуты, безымянный и мизинец согнуты
+    function isPeaceSign(lm){
+      const indexExt  = lm[8].y  < lm[6].y;
+      const middleExt = lm[12].y < lm[10].y;
+      const ringCurled  = lm[16].y > lm[14].y;
+      const pinkyCurled = lm[20].y > lm[18].y;
+      return indexExt && middleExt && ringCurled && pinkyCurled;
+    }
+
+    function toPx(lm){
+      return { x: lm.x * canvasEl.width, y: lm.y * canvasEl.height };
+    }
+
+    // Вырезаем повёрнутый патч из исходного кадра: результат — "выпрямленный"
+    // относительно локальных осей окна фрагмент, который потом рисуется
+    // обратно с тем же поворотом — так содержимое всегда совпадает с рамкой.
+    function extractRotatedPatch(center, angle, w, h){
+      tempCanvas.width = Math.max(1, Math.round(w));
+      tempCanvas.height = Math.max(1, Math.round(h));
+      tempCtx.save();
+      tempCtx.clearRect(0, 0, tempCanvas.width, tempCanvas.height);
+      tempCtx.translate(tempCanvas.width / 2, tempCanvas.height / 2);
+      tempCtx.rotate(-angle);
+      tempCtx.translate(-center.x, -center.y);
+      tempCtx.drawImage(srcCanvas, 0, 0);
+      tempCtx.restore();
+    }
+
+    // Дуотон-фильтр "тепловизор": тёмно-синие тени -> почти белые света
+    function applyThermalDuotone(canvas){
+      const w = canvas.width, h = canvas.height;
+      if(w === 0 || h === 0) return;
+      const c = canvas.getContext('2d');
+      const imgData = c.getImageData(0, 0, w, h);
+      const d = imgData.data;
+      const sR=8, sG=14, sB=40;
+      const hR=225, hG=244, hB=255;
+      for(let i = 0; i < d.length; i += 4){
+        const lum = (0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2]) / 255;
+        let t = (lum - 0.5) * 1.6 + 0.5 + 0.08;
+        t = t < 0 ? 0 : (t > 1 ? 1 : t);
+        d[i]   = sR + (hR - sR) * t;
+        d[i+1] = sG + (hG - sG) * t;
+        d[i+2] = sB + (hB - sB) * t;
+      }
+      c.putImageData(imgData, 0, 0);
+    }
+
+    // сглаживание, чтобы рамка не дрожала от шума в координатах рук
+    let smoothed = null;   // {cx, cy, angle, w, h}
+    let activation = 0;    // 0..1 — плавное появление/исчезновение окна
+
+    function lerp(a, b, t){ return a + (b - a) * t; }
+
+    function render(handsData){
+      ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+
+      const peaceHands = handsData.filter(isPeaceSign);
+      const targetActive = peaceHands.length >= 2 ? 1 : 0;
+      activation = lerp(activation, targetActive, 0.25);
+
+      if(peaceHands.length >= 2){
+        const p1 = toPx({
+          x: (peaceHands[0][8].x + peaceHands[0][12].x) / 2,
+          y: (peaceHands[0][8].y + peaceHands[0][12].y) / 2
+        });
+        const p2 = toPx({
+          x: (peaceHands[1][8].x + peaceHands[1][12].x) / 2,
+          y: (peaceHands[1][8].y + peaceHands[1][12].y) / 2
+        });
+
+        const cx = (p1.x + p2.x) / 2;
+        const cy = (p1.y + p2.y) / 2;
+        const angle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+        const w = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+        const h = w * 0.42;
+
+        if(!smoothed){
+          smoothed = { cx, cy, angle, w, h };
+        } else {
+          smoothed.cx = lerp(smoothed.cx, cx, 0.35);
+          smoothed.cy = lerp(smoothed.cy, cy, 0.35);
+          smoothed.angle = lerp(smoothed.angle, angle, 0.35);
+          smoothed.w = lerp(smoothed.w, w, 0.35);
+          smoothed.h = lerp(smoothed.h, h, 0.35);
+        }
+      }
+
+      if(smoothed && activation > 0.01){
+        const { cx, cy, angle, w, h } = smoothed;
+
+        extractRotatedPatch({ x: cx, y: cy }, angle, w, h);
+        applyThermalDuotone(tempCanvas);
+
+        ctx.save();
+        ctx.globalAlpha = activation;
+        ctx.translate(cx, cy);
+        ctx.rotate(angle);
+        ctx.drawImage(tempCanvas, -w / 2, -h / 2, w, h);
+
+        ctx.shadowColor = 'rgba(255, 230, 0, 0.55)';
+        ctx.shadowBlur = 10;
+        ctx.strokeStyle = '#ffe600';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(-w / 2, -h / 2, w, h);
+        ctx.restore();
+      }
+
+      hintEl.style.opacity = (1 - activation) * 0.85;
+
+      if(handsData.length > 0){
+        handStatusEl.textContent = peaceHands.length >= 2
+          ? 'сканер активен'
+          : `рук обнаружено: ${handsData.length}`;
+      } else {
+        handStatusEl.textContent = 'рук не обнаружено';
+      }
+      setStatus(activation > 0.5 ? 'сканирование' : 'поиск жеста…', activation > 0.5 ? 'active' : null);
+
+      const now = performance.now();
+      fpsEl.textContent = `fps: ${(1000 / (now - lastFrameTime)).toFixed(0)}`;
+      lastFrameTime = now;
+    }
+
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${file}`
+    });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+    hands.onResults((results) => {
+      if(canvasEl.width !== results.image.width || canvasEl.height !== results.image.height){
+        canvasEl.width = results.image.width;
+        canvasEl.height = results.image.height;
+        srcCanvas.width = results.image.width;
+        srcCanvas.height = results.image.height;
+      }
+      srcCtx.drawImage(results.image, 0, 0, srcCanvas.width, srcCanvas.height);
+      render(results.multiHandLandmarks || []);
+    });
+
+    startBtn.addEventListener('click', async () => {
+      startBtn.disabled = true;
+      startBtn.textContent = 'Запрашиваем доступ…';
+      setStatus('запрос доступа к камере', null);
+
+      try{
+        const camera = new Camera(videoEl, {
+          onFrame: async () => { await hands.send({ image: videoEl }); },
+          width: 1280,
+          height: 960
+        });
+        await camera.start();
+
+        startOverlay.classList.add('hidden');
+        setStatus('камера активна', 'active');
+      } catch(err){
+        console.error(err);
+        setStatus('доступ к камере отклонён', 'error');
+        startBtn.disabled = false;
+        startBtn.textContent = 'Повторить попытку';
+
+        const p = startOverlay.querySelector('p');
+        p.textContent = 'Не удалось получить доступ к камере. Проверьте, что сайт открыт по HTTPS (или localhost) и что разрешение на камеру не заблокировано в настройках браузера. Затем нажмите кнопку ещё раз.';
+      }
+    });
+  </script>
+
+</body>
+  </html>
+  
