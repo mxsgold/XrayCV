@@ -78,9 +78,10 @@
 
   .hint{
     position:absolute; left:0; right:0; bottom:10px; z-index:4;
-    text-align:center; font-size:11px; letter-spacing:1px;
+    text-align:center; font-size:10.5px; letter-spacing:0.5px;
     color: var(--accent-2); opacity:0.85; pointer-events:none;
     text-shadow: 0 0 6px rgba(0,0,0,0.8);
+    padding: 0 10px; line-height: 1.5;
   }
 
   .overlay-msg{
@@ -132,10 +133,10 @@
     <div class="corner tr"></div>
     <div class="corner bl"></div>
     <div class="corner br"></div>
-    <div class="hint" id="hint">✌️ + ✌️ — покажи два жеста «виктория», чтобы включить сканер</div>
+    <div class="hint" id="hint">☝️/✌️ на каждой руке — создать окно · ✋ — очистить все окна</div>
 
     <div class="overlay-msg" id="start-overlay">
-      <p>Нужен доступ к камере: отслеживаем обе руки (MediaPipe Hands) и при жесте «виктория» на каждой строим окно-сканер между руками. Всё считается локально в браузере.</p>
+      <p>Нужен доступ к камере: отслеживаем обе руки (MediaPipe Hands). Покажи 1 или 2 пальца на каждой руке, чтобы построить окно-сканер между ними — оно останется на месте, даже когда опустишь руки. Раскрытая ладонь (5 пальцев) очищает все окна. Всё считается локально в браузере.</p>
       <button id="start-btn">Разрешить камеру</button>
     </div>
   </div>
@@ -143,6 +144,7 @@
   <footer>
     <span id="fps-counter">fps: —</span>
     <span id="hand-status">рук не обнаружено</span>
+    <span id="square-count">окон: 0</span>
   </footer>
 
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js" crossorigin="anonymous"></script>
@@ -158,10 +160,11 @@
     const handStatusEl = document.getElementById('hand-status');
     const fpsEl = document.getElementById('fps-counter');
     const hintEl = document.getElementById('hint');
+    const squareCountEl = document.getElementById('square-count');
 
     let lastFrameTime = performance.now();
 
-    // офскрин-канвас с "сырым" кадром камеры — из него вырезаем окно сканера
+    // офскрин-канвас с "сырым" кадром камеры — из него вырезаем окна сканера
     const srcCanvas = document.createElement('canvas');
     const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
     // временный канвас для повёрнутого патча перед дуотон-фильтром
@@ -174,17 +177,40 @@
       if(mode) statusBadge.classList.add(mode);
     }
 
-    // Жест "виктория": указательный и средний разогнуты, безымянный и мизинец согнуты
-    function isPeaceSign(lm){
-      const indexExt  = lm[8].y  < lm[6].y;
-      const middleExt = lm[12].y < lm[10].y;
-      const ringCurled  = lm[16].y > lm[14].y;
-      const pinkyCurled = lm[20].y > lm[18].y;
-      return indexExt && middleExt && ringCurled && pinkyCurled;
+    function dist(a, b){ return Math.hypot(a.x - b.x, a.y - b.y); }
+    function lerp(a, b, t){ return a + (b - a) * t; }
+    function toPx(lm){ return { x: lm.x * canvasEl.width, y: lm.y * canvasEl.height }; }
+
+    // Большой палец разогнут, если кончик заметно дальше от основания
+    // мизинца, чем сустав под ним — не зависит от того, левая рука или правая.
+    function isThumbExtended(lm){
+      const palmBase = lm[17];
+      return dist(lm[4], palmBase) > dist(lm[3], palmBase) * 1.1;
     }
 
-    function toPx(lm){
-      return { x: lm.x * canvasEl.width, y: lm.y * canvasEl.height };
+    // Раскрытая ладонь — все пять пальцев разогнуты. Жест-"сброс".
+    function isOpenPalm(lm){
+      const idx  = lm[8].y  < lm[6].y;
+      const mid  = lm[12].y < lm[10].y;
+      const ring = lm[16].y < lm[14].y;
+      const pky  = lm[20].y < lm[18].y;
+      return idx && mid && ring && pky && isThumbExtended(lm);
+    }
+
+    // Жест-активатор: 1 палец (только указательный) ИЛИ 2 пальца
+    // (указательный + средний, "виктория") — оба варианта равнозначны.
+    function getActivationPose(lm){
+      const idx  = lm[8].y  < lm[6].y;
+      const mid  = lm[12].y < lm[10].y;
+      const ring = lm[16].y > lm[14].y; // согнут
+      const pky  = lm[20].y > lm[18].y; // согнут
+      if(!idx || !ring || !pky) return null;
+      if(mid){
+        // два пальца — якорь между кончиками указательного и среднего
+        return { anchor: { x: (lm[8].x + lm[12].x) / 2, y: (lm[8].y + lm[12].y) / 2 } };
+      }
+      // один палец — якорь на кончике указательного
+      return { anchor: { x: lm[8].x, y: lm[8].y } };
     }
 
     // Вырезаем повёрнутый патч из исходного кадра: результат — "выпрямленный"
@@ -222,28 +248,52 @@
       c.putImageData(imgData, 0, 0);
     }
 
-    // сглаживание, чтобы рамка не дрожала от шума в координатах рук
-    let smoothed = null;   // {cx, cy, angle, w, h}
-    let activation = 0;    // 0..1 — плавное появление/исчезновение окна
+    // Рисует одно термо-окно (живой кроп из srcCanvas) с жёлтой рамкой.
+    function drawThermalWindow(cx, cy, angle, w, h, alpha){
+      extractRotatedPatch({ x: cx, y: cy }, angle, w, h);
+      applyThermalDuotone(tempCanvas);
 
-    function lerp(a, b, t){ return a + (b - a) * t; }
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(cx, cy);
+      ctx.rotate(angle);
+      ctx.drawImage(tempCanvas, -w / 2, -h / 2, w, h);
+
+      ctx.shadowColor = 'rgba(255, 230, 0, 0.55)';
+      ctx.shadowBlur = 10;
+      ctx.strokeStyle = '#ffe600';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(-w / 2, -h / 2, w, h);
+      ctx.restore();
+    }
+
+    const MAX_SQUARES = 15; // защита от бесконечного накопления окон
+
+    let persistentSquares = [];   // "прилипшие" окна: {cx, cy, angle, w, h}
+    let smoothed = null;          // текущее живое окно (пока держится жест)
+    let activation = 0;           // 0..1 — плавное появление живого окна
+    let prevTargetActive = 0;     // жест был активен в прошлом кадре?
 
     function render(handsData){
       ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
 
-      const peaceHands = handsData.filter(isPeaceSign);
-      const targetActive = peaceHands.length >= 2 ? 1 : 0;
+      const anyOpenPalm = handsData.some(isOpenPalm);
+      if(anyOpenPalm){
+        persistentSquares = [];
+        smoothed = null;
+        activation = 0;
+      }
+
+      const poses = handsData.map(getActivationPose);
+      const activeIdx = [];
+      for(let i = 0; i < poses.length; i++){ if(poses[i]) activeIdx.push(i); }
+
+      const targetActive = (!anyOpenPalm && activeIdx.length >= 2) ? 1 : 0;
       activation = lerp(activation, targetActive, 0.25);
 
-      if(peaceHands.length >= 2){
-        const p1 = toPx({
-          x: (peaceHands[0][8].x + peaceHands[0][12].x) / 2,
-          y: (peaceHands[0][8].y + peaceHands[0][12].y) / 2
-        });
-        const p2 = toPx({
-          x: (peaceHands[1][8].x + peaceHands[1][12].x) / 2,
-          y: (peaceHands[1][8].y + peaceHands[1][12].y) / 2
-        });
+      if(targetActive === 1){
+        const p1 = toPx(poses[activeIdx[0]].anchor);
+        const p2 = toPx(poses[activeIdx[1]].anchor);
 
         const cx = (p1.x + p2.x) / 2;
         const cy = (p1.y + p2.y) / 2;
@@ -262,35 +312,36 @@
         }
       }
 
-      if(smoothed && activation > 0.01){
-        const { cx, cy, angle, w, h } = smoothed;
+      // жест только что отпустили — окно "прилипает" на своём месте
+      if(prevTargetActive === 1 && targetActive === 0 && smoothed){
+        persistentSquares.push({ ...smoothed });
+        if(persistentSquares.length > MAX_SQUARES) persistentSquares.shift();
+        smoothed = null;
+        activation = 0;
+      }
+      prevTargetActive = targetActive;
 
-        extractRotatedPatch({ x: cx, y: cy }, angle, w, h);
-        applyThermalDuotone(tempCanvas);
-
-        ctx.save();
-        ctx.globalAlpha = activation;
-        ctx.translate(cx, cy);
-        ctx.rotate(angle);
-        ctx.drawImage(tempCanvas, -w / 2, -h / 2, w, h);
-
-        ctx.shadowColor = 'rgba(255, 230, 0, 0.55)';
-        ctx.shadowBlur = 10;
-        ctx.strokeStyle = '#ffe600';
-        ctx.lineWidth = 3;
-        ctx.strokeRect(-w / 2, -h / 2, w, h);
-        ctx.restore();
+      // сначала все "прилипшие" окна — они статичны по позиции,
+      // но продолжают показывать live-видео сквозь себя
+      for(const sq of persistentSquares){
+        drawThermalWindow(sq.cx, sq.cy, sq.angle, sq.w, sq.h, 1);
       }
 
-      hintEl.style.opacity = (1 - activation) * 0.85;
+      // затем текущее формируемое окно (с плавным появлением/исчезновением)
+      if(smoothed && activation > 0.01){
+        drawThermalWindow(smoothed.cx, smoothed.cy, smoothed.angle, smoothed.w, smoothed.h, activation);
+      }
+
+      hintEl.style.opacity = persistentSquares.length === 0 ? (1 - activation) * 0.85 : 0.5;
 
       if(handsData.length > 0){
-        handStatusEl.textContent = peaceHands.length >= 2
-          ? 'сканер активен'
+        handStatusEl.textContent = targetActive === 1
+          ? 'окно активно'
           : `рук обнаружено: ${handsData.length}`;
       } else {
         handStatusEl.textContent = 'рук не обнаружено';
       }
+      squareCountEl.textContent = `окон: ${persistentSquares.length}`;
       setStatus(activation > 0.5 ? 'сканирование' : 'поиск жеста…', activation > 0.5 ? 'active' : null);
 
       const now = performance.now();
@@ -346,5 +397,4 @@
   </script>
 
 </body>
-  </html>
-  
+</html>
